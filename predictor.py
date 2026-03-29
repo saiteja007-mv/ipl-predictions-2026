@@ -132,10 +132,12 @@ def load_model() -> tuple:
                 model = joblib.load(path)
                 model_name = fname
                 break
-            except Exception:
+            except Exception as e:
+                print(f"[predictor] Failed to load {fname}: {e}")
                 continue
 
     if model is None:
+        print(f"[predictor] MODEL_DIR={MODEL_DIR}, files={list(MODEL_DIR.iterdir()) if MODEL_DIR.exists() else 'DIR NOT FOUND'}")
         return None, None, None
 
     feature_columns_path = MODEL_DIR / "feature_columns.pkl"

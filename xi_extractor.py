@@ -22,6 +22,7 @@ Python requirements (already in requirements.txt):
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,20 @@ from typing import Optional
 try:
     import pytesseract
     from PIL import Image, ImageEnhance, ImageFilter
+
+    # Auto-detect Tesseract on Windows if not already in PATH
+    if os.name == "nt":
+        import shutil
+        if not shutil.which("tesseract"):
+            _win_paths = [
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+            ]
+            for _p in _win_paths:
+                if os.path.isfile(_p):
+                    pytesseract.pytesseract.tesseract_cmd = _p
+                    break
 
     TESSERACT_OK = True
 except ImportError:
@@ -146,8 +161,25 @@ def ocr_image(image_path: str) -> str:
 # Ollama LLM parsing (optional)
 # ---------------------------------------------------------------------------
 
-_OLLAMA_BASE_URL = "http://localhost:11434"
+def _resolve_ollama_url() -> str:
+    """Build a usable Ollama API base URL from OLLAMA_HOST env var."""
+    raw = os.environ.get("OLLAMA_HOST", "").strip()
+    if not raw:
+        return "http://127.0.0.1:11434"
+    # Already a full URL
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw.rstrip("/")
+    # Bind address like "0.0.0.0" or "0.0.0.0:11434" — connect via 127.0.0.1
+    host, _, port = raw.partition(":")
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    port = port or "11434"
+    return f"http://{host}:{port}"
+
+
+_OLLAMA_BASE_URL = _resolve_ollama_url()
 _OLLAMA_TIMEOUT = 30  # seconds
+_OLLAMA_VISION_TIMEOUT = 120  # seconds (large images / slow models)
 
 
 def _is_ollama_running() -> bool:
@@ -159,6 +191,61 @@ def _is_ollama_running() -> bool:
         return resp.status_code == 200
     except Exception:
         return False
+
+
+def is_ollama_running() -> bool:
+    """Public alias: True if the Ollama HTTP API responds (``/api/tags``)."""
+    return _is_ollama_running()
+
+
+def get_ollama_models() -> list[str]:
+    """Return installed Ollama model names (e.g. ``llama3.2:latest``, ``llava:latest``).
+
+    Returns an empty list if Ollama is unreachable or ``requests`` is unavailable.
+    """
+    if not REQUESTS_OK or not _is_ollama_running():
+        return []
+    try:
+        resp = _requests.get(f"{_OLLAMA_BASE_URL}/api/tags", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        names = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        return sorted(names)
+    except Exception as exc:
+        print(f"Could not list Ollama models: {exc}")
+        return []
+
+
+def _clean_name_lines(response_text: str) -> list[str]:
+    """Turn model output into a list of player-name lines."""
+    if not response_text or not response_text.strip():
+        return []
+    raw_names = [line.strip() for line in response_text.splitlines() if line.strip()]
+    # Strip leading "1." / "1)" numbering
+    stripped = []
+    for n in raw_names:
+        n2 = re.sub(r"^\s*\d+[\).\s]+", "", n).strip()
+        if n2:
+            stripped.append(n2)
+    cleaned = [
+        n
+        for n in stripped
+        if not any(
+            kw in n.lower()
+            for kw in (
+                "here are",
+                "here is",
+                "following",
+                "the players",
+                "team:",
+                "xi:",
+                "playing eleven",
+            )
+        )
+        and len(n) > 2
+        and len(n) < 60
+    ]
+    return cleaned[:11]
 
 
 def parse_names_with_ollama(text: str, model: str = "llama3.2") -> list[str]:
@@ -211,16 +298,71 @@ def parse_names_with_ollama(text: str, model: str = "llama3.2") -> list[str]:
         print(f"Ollama request failed: {exc}")
         return []
 
-    # Parse response: one name per line, strip blank lines
-    raw_names = [line.strip() for line in response_text.splitlines() if line.strip()]
-    # Remove lines that look like meta-text (e.g. "Here are the players:")
-    cleaned = [
-        n for n in raw_names
-        if not any(kw in n.lower() for kw in ("here are", "player", "team:", "xi:"))
-        and len(n) > 2
-        and len(n) < 60
-    ]
-    return cleaned[:11]
+    return _clean_name_lines(response_text)
+
+
+def extract_names_ollama_vision(image_path: str, model: str) -> list[str]:
+    """Use an Ollama **vision** model to read player names directly from the image.
+
+    Calls ``POST /api/chat`` with a base64-encoded image. If the model does not
+    support images, Ollama returns an error and this function returns [].
+
+    Args:
+        image_path: Path to PNG/JPG/JPEG on disk.
+        model: Full Ollama model name (e.g. ``llava:latest``, ``moondream:latest``).
+
+    Returns:
+        Parsed player names, or empty list on failure.
+    """
+    if not REQUESTS_OK or not _is_ollama_running():
+        return []
+
+    import base64
+
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+    except Exception as exc:
+        print(f"Could not read image for vision: {exc}")
+        return []
+
+    prompt = (
+        "This image is a cricket IPL playing XI (line-up) announcement, app screenshot, "
+        "or TV graphic. Extract every player name you can read. "
+        "Return ONLY one player name per line, no numbers, bullets, or commentary. "
+        "Aim for up to 11 names; if fewer are visible, return those you see."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [b64],
+            }
+        ],
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": 512},
+    }
+
+    try:
+        resp = _requests.post(
+            f"{_OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            timeout=_OLLAMA_VISION_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            print(f"Ollama vision HTTP {resp.status_code}: {resp.text[:300]}")
+            return []
+        data = resp.json()
+        msg = data.get("message") or {}
+        response_text = msg.get("content") or ""
+    except Exception as exc:
+        print(f"Ollama vision request failed: {exc}")
+        return []
+
+    return _clean_name_lines(response_text)
 
 
 # ---------------------------------------------------------------------------
@@ -376,28 +518,70 @@ def _deduplicate(names: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def extract_xi_from_image(image_path: str) -> list[str]:
+def extract_xi_from_image(image_path: str, ollama_model: str | None = None) -> list[str]:
     """Extract playing XI player names from an image.
 
-    Pipeline:
-    1. Tesseract OCR extracts raw text from the image.
-    2. If Ollama is running locally, send OCR text to LLM for name extraction.
-       Otherwise, fall back to regex + heuristic parsing.
-    3. Fuzzy-match extracted names against the known IPL player database to
-       return canonical names.
-    4. Return up to 11 matched player names.
+    Pipeline (when ``ollama_model`` is set and Ollama is running):
+    1. Try **vision**: ``extract_names_ollama_vision`` (best for screenshots).
+    2. If that returns nothing, **OCR** + same model via ``/api/generate`` (text).
+    3. Regex + fuzzy fallback.
+
+    Pipeline (default, ``ollama_model`` is None):
+    1. Tesseract OCR → text.
+    2. If Ollama is up, default text model parses names; else regex/heuristic.
+    3. Fuzzy-match to the IPL player list.
 
     Args:
         image_path: Path to the uploaded image (PNG/JPG/JPEG).
+        ollama_model: Optional Ollama model name from the UI (e.g. ``llava:latest``).
+            When set, vision is attempted first; text-only models still work via OCR.
 
     Returns:
         List of up to 11 canonical player name strings.
-        Returns empty list if OCR fails or no names are found.
 
     Raises:
-        ImportError: If pytesseract/Pillow are not installed (install message
-            included in the exception text).
+        ImportError: If pytesseract/Pillow are not installed **and** no usable
+            Ollama vision path produced a result (same as before for OCR-only runs).
     """
+    known = _load_known_players()
+
+    def _finalize(extracted: list[str]) -> list[str]:
+        if not extracted:
+            return []
+        print(f"Extracted {len(extracted)} raw names: {extracted}")
+        if known:
+            matched = fuzzy_match_players(extracted, known)
+        else:
+            matched = extracted
+        final = matched[:11]
+        print(f"Final matched names ({len(final)}): {final}")
+        return final
+
+    # --- User selected an Ollama model (Streamlit): vision → OCR+LLM → regex ---
+    if ollama_model and _is_ollama_running():
+        print(f"Using Ollama model: {ollama_model}")
+        extracted = extract_names_ollama_vision(image_path, ollama_model)
+        if extracted:
+            return _finalize(extracted)
+
+        raw_text = ""
+        if TESSERACT_OK:
+            raw_text = ocr_image(image_path)
+        else:
+            print("Vision failed and Tesseract not available — cannot OCR.")
+            return []
+
+        if not raw_text.strip():
+            print("OCR returned no text after empty vision response.")
+            return []
+
+        print(f"Vision empty; OCR fallback ({len(raw_text)} chars):\n{raw_text[:400]}\n…")
+        extracted = parse_names_with_ollama(raw_text, model=ollama_model)
+        if not extracted:
+            extracted = parse_names_with_regex(raw_text, known)
+        return _finalize(extracted)
+
+    # --- Default: OCR required ---
     if not TESSERACT_OK:
         raise ImportError(
             "pytesseract and Pillow are required.\n"
@@ -405,7 +589,6 @@ def extract_xi_from_image(image_path: str) -> list[str]:
             "  sudo apt-get install tesseract-ocr  # (or brew install tesseract on macOS)"
         )
 
-    # Step 1: OCR
     raw_text = ocr_image(image_path)
     if not raw_text.strip():
         print("OCR returned no text.")
@@ -413,33 +596,18 @@ def extract_xi_from_image(image_path: str) -> list[str]:
 
     print(f"OCR text ({len(raw_text)} chars):\n{raw_text[:400]}\n…")
 
-    # Step 2: Name extraction
-    extracted: list[str] = []
-
     if _is_ollama_running():
         print("Ollama detected — using LLM for name extraction.")
         extracted = parse_names_with_ollama(raw_text)
         if not extracted:
             print("Ollama returned no names — falling back to regex.")
-            extracted = parse_names_with_regex(raw_text, _load_known_players())
+            extracted = parse_names_with_regex(raw_text, known)
     else:
         print("Ollama not available — using regex/heuristic extraction.")
-        extracted = parse_names_with_regex(raw_text, _load_known_players())
+        extracted = parse_names_with_regex(raw_text, known)
 
     if not extracted:
         print("No names extracted from OCR text.")
         return []
 
-    print(f"Extracted {len(extracted)} raw names: {extracted}")
-
-    # Step 3: Fuzzy-match against known player database
-    known = _load_known_players()
-    if known:
-        matched = fuzzy_match_players(extracted, known)
-    else:
-        matched = extracted  # no DB — return raw extractions
-
-    # Step 4: Return up to 11
-    final = matched[:11]
-    print(f"Final matched names ({len(final)}): {final}")
-    return final
+    return _finalize(extracted)

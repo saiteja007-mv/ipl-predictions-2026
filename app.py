@@ -143,10 +143,13 @@ except ImportError as _e:
 
 # XI extractor — optional; gracefully degrade if OCR deps not installed
 try:
-    from xi_extractor import extract_xi_from_image
+    from xi_extractor import extract_xi_from_image, get_ollama_models, is_ollama_running
+
     XI_EXTRACTOR_OK = True
 except ImportError:
     XI_EXTRACTOR_OK = False
+    is_ollama_running = None  # type: ignore
+    get_ollama_models = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Cached resource loaders
@@ -320,6 +323,57 @@ def page_predict() -> None:
             st.caption(f"{team2}: {len(team2_xi)} player(s) entered")
 
     elif xi_input_method == "Upload photo of XI announcement":
+        selected_ollama_model = None
+        if XI_EXTRACTOR_OK and is_ollama_running is not None:
+            try:
+                ollama_up = is_ollama_running()
+            except Exception as ex:
+                ollama_up = False
+                st.caption(f"Could not check Ollama: {ex}")
+            if ollama_up:
+                try:
+                    models_list = get_ollama_models() if get_ollama_models else []
+                except Exception:
+                    models_list = []
+                if models_list:
+                    c_ollama, c_refresh = st.columns([4, 1])
+                    with c_ollama:
+                        selected_ollama_model = st.selectbox(
+                            "Ollama model for XI image analysis",
+                            models_list,
+                            index=0,
+                            help=(
+                                "Requires Ollama running locally (or set OLLAMA_HOST). "
+                                "Vision models (e.g. llava, moondream, llama3.2-vision) read the image directly; "
+                                "text-only models use Tesseract OCR + your selected model."
+                            ),
+                            key="ollama_xi_model_select",
+                        )
+                    with c_refresh:
+                        st.write("")  # align button
+                        st.write("")
+                        if st.button("Refresh models", key="ollama_refresh_models"):
+                            st.rerun()
+                    st.success(
+                        "Ollama detected — using the selected model (vision when supported, else OCR + model)."
+                    )
+                else:
+                    st.warning(
+                        "Ollama is running but no models are listed. Install one, e.g. "
+                        "`ollama pull llava` or `ollama pull moondream`, then click **Refresh models**."
+                    )
+            else:
+                st.info(
+                    "Ollama is not reachable at `localhost:11434` (or `OLLAMA_HOST`). "
+                    "XI photos will use **Tesseract OCR + regex/fuzzy** only. "
+                    "Start the Ollama app and reload this page to choose a model."
+                )
+
+        # Initialise session state for cached XI results
+        for _k in ("_t1_xi_result", "_t1_xi_file_id", "_t2_xi_result", "_t2_xi_file_id"):
+            if _k not in st.session_state:
+                st.session_state[_k] = [] if "result" in _k else None
+
         xi_col1, xi_col2 = st.columns(2)
 
         with xi_col1:
@@ -330,21 +384,30 @@ def page_predict() -> None:
                 key="t1_xi_upload",
             )
             if t1_img is not None:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp.write(t1_img.read())
-                    tmp_path = tmp.name
-                with st.spinner("Extracting players from image…"):
-                    try:
-                        team1_xi = extract_xi_from_image(tmp_path)
-                    except ImportError as exc:
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.error(f"OCR failed: {exc}")
+                t1_file_id = (t1_img.name, t1_img.size)
+                if t1_file_id != st.session_state["_t1_xi_file_id"]:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp.write(t1_img.read())
+                        tmp_path = tmp.name
+                    with st.spinner("Analyzing image (Ollama / OCR)…"):
+                        try:
+                            st.session_state["_t1_xi_result"] = extract_xi_from_image(
+                                tmp_path, ollama_model=selected_ollama_model
+                            )
+                        except ImportError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(f"Extraction failed: {exc}")
+                    st.session_state["_t1_xi_file_id"] = t1_file_id
+                team1_xi = st.session_state["_t1_xi_result"]
                 if team1_xi:
                     st.success(f"Found {len(team1_xi)} player(s)")
                     st.write(team1_xi)
                 else:
                     st.warning("Could not extract names — please type manually")
+            else:
+                st.session_state["_t1_xi_result"] = []
+                st.session_state["_t1_xi_file_id"] = None
 
         with xi_col2:
             st.write(f"**{team2} XI Photo**")
@@ -354,21 +417,30 @@ def page_predict() -> None:
                 key="t2_xi_upload",
             )
             if t2_img is not None:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp.write(t2_img.read())
-                    tmp_path = tmp.name
-                with st.spinner("Extracting players from image…"):
-                    try:
-                        team2_xi = extract_xi_from_image(tmp_path)
-                    except ImportError as exc:
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.error(f"OCR failed: {exc}")
+                t2_file_id = (t2_img.name, t2_img.size)
+                if t2_file_id != st.session_state["_t2_xi_file_id"]:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp.write(t2_img.read())
+                        tmp_path = tmp.name
+                    with st.spinner("Analyzing image (Ollama / OCR)…"):
+                        try:
+                            st.session_state["_t2_xi_result"] = extract_xi_from_image(
+                                tmp_path, ollama_model=selected_ollama_model
+                            )
+                        except ImportError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error(f"Extraction failed: {exc}")
+                    st.session_state["_t2_xi_file_id"] = t2_file_id
+                team2_xi = st.session_state["_t2_xi_result"]
                 if team2_xi:
                     st.success(f"Found {len(team2_xi)} player(s)")
                     st.write(team2_xi)
                 else:
                     st.warning("Could not extract names — please type manually")
+            else:
+                st.session_state["_t2_xi_result"] = []
+                st.session_state["_t2_xi_file_id"] = None
 
     st.markdown("")
     predict_btn = st.button("🔮 Predict!", use_container_width=False)
