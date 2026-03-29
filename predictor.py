@@ -167,12 +167,36 @@ def load_elo_ratings() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def load_enhanced_player_stats() -> pd.DataFrame:
+    """Load player stats, preferring the global T20 enhanced version.
+
+    Tries ``Datasets/player_stats_enhanced.csv`` first (produced by
+    ``t20_data_pipeline.py``), falls back to ``Datasets/player_stats.csv``.
+    The enhanced file contains global T20 career stats for all players,
+    including those with zero IPL matches (new auction buys, uncapped players).
+
+    Returns:
+        Player stats DataFrame.  Empty DataFrame if neither file exists.
+    """
+    for fname in ("player_stats_enhanced.csv", "player_stats.csv"):
+        path = DATASET_DIR / fname
+        if path.exists():
+            try:
+                df = pd.read_csv(path, low_memory=False)
+                if not df.empty:
+                    return df
+            except Exception:
+                continue
+    return pd.DataFrame()
+
+
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load core datasets: matches, player_match_stats, player_stats.
 
     Returns:
         (matches_df, player_match_stats_df, player_stats_df). Any missing
-        dataset is returned as an empty DataFrame.
+        dataset is returned as an empty DataFrame.  player_stats prefers
+        the global T20 enhanced version if available.
     """
     def _read(fname: str) -> pd.DataFrame:
         path = DATASET_DIR / fname
@@ -185,7 +209,7 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     matches = _read("matches.csv")
     player_match_stats = _read("player_match_stats.csv")
-    player_stats = _read("player_stats.csv")
+    player_stats = load_enhanced_player_stats()
 
     # Normalize matches column names
     if not matches.empty:
@@ -413,33 +437,88 @@ def get_venue_stats(venue: str, team1: str, team2: str, matches: pd.DataFrame) -
     }
 
 
-def get_player_strength(team: str, player_match_stats: pd.DataFrame) -> dict:
+def get_player_strength(
+    team: str,
+    player_match_stats: pd.DataFrame,
+    enhanced_player_stats: Optional[pd.DataFrame] = None,
+    team_xi: Optional[list[str]] = None,
+) -> dict:
     """Compute aggregate player strength metrics for a team.
+
+    For players with zero IPL matches (new auction buys, uncapped players),
+    falls back to global T20 career stats from ``player_stats_enhanced.csv``
+    instead of using league-average defaults.
 
     Args:
         team: Team name.
         player_match_stats: Per-player per-match stats DataFrame.
+        enhanced_player_stats: Optional enhanced player stats DataFrame loaded
+            from ``player_stats_enhanced.csv`` via ``load_enhanced_player_stats()``.
+            When provided, used to fill in stats for players with no IPL history.
+        team_xi: Optional list of player names in the playing XI.  When
+            provided, strength is computed only over these players.
 
     Returns:
         Dict with keys: sr (batting SR), avg (batting avg), econ (bowling economy),
         exp (experience = unique players), bpct (boundary %)
     """
     defaults = {"sr": 130.0, "avg": 25.0, "econ": 8.0, "exp": 11, "bpct": 25.0}
-    if player_match_stats.empty or "team" not in player_match_stats.columns:
-        return defaults
 
-    team_data = player_match_stats[player_match_stats["team"] == team]
-    if team_data.empty:
-        return defaults
+    # --- IPL match stats path ---
+    ipl_result = {"sr": None, "avg": None, "econ": None, "exp": None, "bpct": None}
 
+    if not player_match_stats.empty and "team" in player_match_stats.columns:
+        team_data = player_match_stats[player_match_stats["team"] == team]
+        if team_xi:
+            pc = next((c for c in team_data.columns if "player" in c.lower()), None)
+            if pc:
+                team_data = team_data[team_data[pc].isin(team_xi)]
+        if not team_data.empty:
+            ipl_result["sr"] = team_data["strike_rate"].mean() if "strike_rate" in team_data.columns else None
+            ipl_result["avg"] = team_data["runs_scored"].mean() if "runs_scored" in team_data.columns else None
+            ipl_result["econ"] = team_data["economy"].mean() if "economy" in team_data.columns else None
+            ipl_result["exp"] = team_data["player"].nunique() if "player" in team_data.columns else None
+            ipl_result["bpct"] = team_data["boundary_pct"].mean() if "boundary_pct" in team_data.columns else None
+
+    # --- Enhanced / global T20 stats path for new players ---
+    global_sr, global_avg, global_econ = None, None, None
+
+    if enhanced_player_stats is not None and not enhanced_player_stats.empty:
+        ep = enhanced_player_stats
+
+        # If we have a specific XI, filter to those players only
+        name_col = next(
+            (c for c in ep.columns if c.lower() in ("player", "name", "player_name")),
+            None,
+        )
+        if team_xi and name_col:
+            ep_subset = ep[ep[name_col].isin(team_xi)]
+        else:
+            ep_subset = ep
+
+        # Use global T20 batting SR for players that are new to IPL
+        if "is_new_to_ipl" in ep_subset.columns and "t20_batting_sr" in ep_subset.columns:
+            new_players = ep_subset[ep_subset["is_new_to_ipl"] == 1]
+            if not new_players.empty:
+                global_sr = new_players["t20_batting_sr"].mean()
+                if "t20_batting_avg" in new_players.columns:
+                    global_avg = new_players["t20_batting_avg"].mean()
+                if "t20_bowling_econ" in new_players.columns:
+                    global_econ = new_players["t20_bowling_econ"].mean()
+
+    # --- Blend: use IPL stats where available, fill gaps with global T20 ---
     result = {}
-    result["sr"] = team_data["strike_rate"].mean() if "strike_rate" in team_data.columns else 130.0
-    result["avg"] = team_data["runs_scored"].mean() if "runs_scored" in team_data.columns else 25.0
-    result["econ"] = team_data["economy"].mean() if "economy" in team_data.columns else 8.0
-    result["exp"] = team_data["player"].nunique() if "player" in team_data.columns else 11
-    result["bpct"] = team_data["boundary_pct"].mean() if "boundary_pct" in team_data.columns else 25.0
+    result["sr"] = ipl_result["sr"] if ipl_result["sr"] is not None and not pd.isna(ipl_result["sr"]) \
+        else (global_sr if global_sr is not None else defaults["sr"])
+    result["avg"] = ipl_result["avg"] if ipl_result["avg"] is not None and not pd.isna(ipl_result["avg"]) \
+        else (global_avg if global_avg is not None else defaults["avg"])
+    result["econ"] = ipl_result["econ"] if ipl_result["econ"] is not None and not pd.isna(ipl_result["econ"]) \
+        else (global_econ if global_econ is not None else defaults["econ"])
+    result["exp"] = ipl_result["exp"] if ipl_result["exp"] is not None else defaults["exp"]
+    result["bpct"] = ipl_result["bpct"] if ipl_result["bpct"] is not None and not pd.isna(ipl_result["bpct"]) \
+        else defaults["bpct"]
 
-    # Replace NaN with defaults
+    # Final NaN guard
     for k, v in defaults.items():
         if pd.isna(result.get(k)):
             result[k] = v
@@ -476,6 +555,9 @@ def build_features(
     feature_columns: list[str],
     elo_ratings: Optional[dict] = None,
     season: int = 2026,
+    team1_xi: Optional[list[str]] = None,
+    team2_xi: Optional[list[str]] = None,
+    enhanced_player_stats: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Build a feature vector for a match, aligned to model's expected columns.
 
@@ -490,6 +572,11 @@ def build_features(
         feature_columns: Ordered list of feature names from training.
         elo_ratings: Optional dict of team → Elo rating.
         season: Current season year.
+        team1_xi: Optional list of playing XI names for team1.
+        team2_xi: Optional list of playing XI names for team2.
+        enhanced_player_stats: Optional enhanced player stats DataFrame from
+            ``load_enhanced_player_stats()``.  Used to substitute global T20
+            stats for players with no IPL match history.
 
     Returns:
         DataFrame with one row aligned to feature_columns.
@@ -553,9 +640,9 @@ def build_features(
     t2_elo = elo_ratings.get(team2, default_elo)
     t1_elo_prob = _elo_win_prob(t1_elo, t2_elo)
 
-    # Player strength
-    t1_ps = get_player_strength(team1, player_match_stats)
-    t2_ps = get_player_strength(team2, player_match_stats)
+    # Player strength — uses enhanced global T20 stats for new IPL players
+    t1_ps = get_player_strength(team1, player_match_stats, enhanced_player_stats, team1_xi)
+    t2_ps = get_player_strength(team2, player_match_stats, enhanced_player_stats, team2_xi)
 
     # Momentum (simplified: win_rate_last5 as proxy)
     t1_momentum = t1_wr
@@ -630,6 +717,8 @@ def predict_match(
     player_match_stats: pd.DataFrame,
     elo_ratings: Optional[dict] = None,
     season: int = 2026,
+    team1_xi: Optional[list[str]] = None,
+    team2_xi: Optional[list[str]] = None,
 ) -> dict:
     """Run a full match prediction.
 
@@ -645,14 +734,23 @@ def predict_match(
         player_match_stats: Per-player stats DataFrame.
         elo_ratings: Optional Elo ratings dict.
         season: Season year.
+        team1_xi: Optional list of playing XI names for team1.  When provided,
+            player strength is computed over these specific players and global
+            T20 stats are used for any players with no IPL history.
+        team2_xi: Optional list of playing XI names for team2.
 
     Returns:
         Dict with keys: winner, prob_team1, prob_team2, confidence,
         form_team1, form_team2, h2h, venue_stats.
     """
+    # Load enhanced player stats once for both teams
+    enhanced_player_stats = load_enhanced_player_stats() if (team1_xi or team2_xi) else None
+
     X = build_features(
         team1, team2, venue, toss_winner, toss_decision,
-        matches, player_match_stats, feature_columns, elo_ratings, season
+        matches, player_match_stats, feature_columns, elo_ratings, season,
+        team1_xi=team1_xi, team2_xi=team2_xi,
+        enhanced_player_stats=enhanced_player_stats,
     )
 
     proba = model.predict_proba(X)[0]

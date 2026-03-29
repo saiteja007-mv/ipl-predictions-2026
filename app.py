@@ -10,6 +10,7 @@ app.py — IPL 2026 Predictions Streamlit Web App.
 
 import os
 import io
+import tempfile
 import uuid
 import datetime
 import streamlit as st
@@ -139,6 +140,13 @@ try:
 except ImportError as _e:
     st.error(f"Failed to import predictor.py: {_e}")
     PREDICTOR_OK = False
+
+# XI extractor — optional; gracefully degrade if OCR deps not installed
+try:
+    from xi_extractor import extract_xi_from_image
+    XI_EXTRACTOR_OK = True
+except ImportError:
+    XI_EXTRACTOR_OK = False
 
 # ---------------------------------------------------------------------------
 # Cached resource loaders
@@ -271,14 +279,96 @@ def page_predict() -> None:
     with col5:
         toss_decision = st.selectbox("Toss Decision", ["bat", "field"], key="p_toss_dec")
 
-    with st.expander("Optional: Enter Playing XI"):
+    # --- Playing XI (Optional) ---
+    st.subheader("📋 Playing XI (Optional — improves prediction accuracy)")
+
+    xi_input_method = st.radio(
+        "How to enter Playing XI?",
+        ["Skip", "Type names manually", "Upload photo of XI announcement"],
+        horizontal=True,
+        key="xi_method",
+    )
+
+    # Hint when photo upload selected but deps missing
+    if xi_input_method == "Upload photo of XI announcement" and not XI_EXTRACTOR_OK:
+        st.warning(
+            "OCR dependencies not installed. "
+            "Run `pip install pytesseract Pillow rapidfuzz` and "
+            "`sudo apt-get install tesseract-ocr`, then restart the app."
+        )
+        xi_input_method = "Skip"
+
+    team1_xi: list[str] = []
+    team2_xi: list[str] = []
+
+    if xi_input_method == "Type names manually":
         xi_col1, xi_col2 = st.columns(2)
         with xi_col1:
-            st.text_area(f"{team1} Playing XI (comma-separated)", key="p_xi1",
-                         placeholder="Player1, Player2, ..., Player11")
+            t1_text = st.text_area(
+                f"{team1} XI (one name per line)", height=200, key="p_xi1_text"
+            )
+            team1_xi = [n.strip() for n in t1_text.splitlines() if n.strip()]
         with xi_col2:
-            st.text_area(f"{team2} Playing XI (comma-separated)", key="p_xi2",
-                         placeholder="Player1, Player2, ..., Player11")
+            t2_text = st.text_area(
+                f"{team2} XI (one name per line)", height=200, key="p_xi2_text"
+            )
+            team2_xi = [n.strip() for n in t2_text.splitlines() if n.strip()]
+
+        if team1_xi:
+            st.caption(f"{team1}: {len(team1_xi)} player(s) entered")
+        if team2_xi:
+            st.caption(f"{team2}: {len(team2_xi)} player(s) entered")
+
+    elif xi_input_method == "Upload photo of XI announcement":
+        xi_col1, xi_col2 = st.columns(2)
+
+        with xi_col1:
+            st.write(f"**{team1} XI Photo**")
+            t1_img = st.file_uploader(
+                f"Upload {team1} XI",
+                type=["png", "jpg", "jpeg"],
+                key="t1_xi_upload",
+            )
+            if t1_img is not None:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(t1_img.read())
+                    tmp_path = tmp.name
+                with st.spinner("Extracting players from image…"):
+                    try:
+                        team1_xi = extract_xi_from_image(tmp_path)
+                    except ImportError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"OCR failed: {exc}")
+                if team1_xi:
+                    st.success(f"Found {len(team1_xi)} player(s)")
+                    st.write(team1_xi)
+                else:
+                    st.warning("Could not extract names — please type manually")
+
+        with xi_col2:
+            st.write(f"**{team2} XI Photo**")
+            t2_img = st.file_uploader(
+                f"Upload {team2} XI",
+                type=["png", "jpg", "jpeg"],
+                key="t2_xi_upload",
+            )
+            if t2_img is not None:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(t2_img.read())
+                    tmp_path = tmp.name
+                with st.spinner("Extracting players from image…"):
+                    try:
+                        team2_xi = extract_xi_from_image(tmp_path)
+                    except ImportError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        st.error(f"OCR failed: {exc}")
+                if team2_xi:
+                    st.success(f"Found {len(team2_xi)} player(s)")
+                    st.write(team2_xi)
+                else:
+                    st.warning("Could not extract names — please type manually")
 
     st.markdown("")
     predict_btn = st.button("🔮 Predict!", use_container_width=False)
@@ -297,6 +387,8 @@ def page_predict() -> None:
                     matches=matches,
                     player_match_stats=player_match_stats,
                     elo_ratings=elo_ratings,
+                    team1_xi=team1_xi or None,
+                    team2_xi=team2_xi or None,
                 )
             except Exception as e:
                 st.error(f"Prediction failed: {e}")

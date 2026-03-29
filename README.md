@@ -176,17 +176,97 @@ Historical data sourced from Kaggle (2008–2025):
 - `Datasets/player_match_stats.csv` — per-player per-match statistics
 - `Datasets/features_matrix.csv` — pre-computed feature matrix
 
+## Global T20 Player Data Pipeline
+
+New and uncapped IPL players have no IPL history, so the model previously used
+league-average defaults for their stats.  `t20_data_pipeline.py` fixes this by
+pulling career stats from **all T20 formats** (international T20Is, BBL, PSL,
+SA20, CPL, etc.) via [cricsheet.org](https://cricsheet.org/downloads/) open data.
+
+### Run the pipeline
+
+```bash
+# First time: download ~200 MB of cricsheet YAML data and build stats
+python t20_data_pipeline.py --download
+
+# Subsequent runs: skip download, rebuild stats from cached data
+python t20_data_pipeline.py --no-parse   # use cached deliveries CSV
+python t20_data_pipeline.py              # re-parse YAML files
+```
+
+Output files:
+- `Datasets/cricsheet/` — raw YAML match files from cricsheet.org
+- `Datasets/player_stats_enhanced.csv` — global T20 career stats for all players
+- `Datasets/player_name_map.csv` — name normalisation lookup table
+
+The app and predictor automatically prefer `player_stats_enhanced.csv` over
+`player_stats.csv` when it exists.
+
+### Dependencies
+
+```bash
+pip install requests pyyaml rapidfuzz
+```
+
+PyYAML is required for YAML parsing.
+
+---
+
+## Playing XI from Photo (OCR)
+
+On the **🏏 Predict Match** page you can now supply the playing XI by:
+
+1. **Typing names manually** — one player per line
+2. **Uploading a screenshot** of the XI announcement (IPL app, Twitter, TV graphic)
+
+The photo upload uses Tesseract OCR to extract text, then optionally a local
+[Ollama](https://ollama.com/) LLM (`llama3.2` or similar) to parse player names,
+with a regex + fuzzy-match fallback when Ollama is not running.
+
+### Setup OCR
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install tesseract-ocr
+
+# macOS
+brew install tesseract
+
+# Python packages (already in requirements.txt)
+pip install pytesseract Pillow rapidfuzz
+```
+
+### Optional: Ollama for better name extraction
+
+```bash
+# Install Ollama: https://ollama.com
+ollama pull llama3.2   # or mistral, llama3, etc.
+ollama serve           # start local API on port 11434
+```
+
+If Ollama is not running, the extractor falls back to regex + fuzzy matching
+against the player database — no internet connection required.
+
+---
+
 ## Project Structure
 
 ```
 ipl-predictions-2026/
-├── training.ipynb          # Model training pipeline
-├── prediction.ipynb        # Match prediction interface
-├── video_card.py           # Prediction card image generator
-├── video_card_demo.py      # Demo card (no model needed)
-├── project_paths.py        # Path configuration
-├── requirements.txt        # Dependencies
-├── Datasets/               # Historical IPL data (CSV)
-├── Models/                 # Trained model artifacts (PKL)
-└── output/                 # Generated prediction card images
+├── training.ipynb              # Model training pipeline
+├── prediction.ipynb            # Match prediction interface
+├── app.py                      # Streamlit web app (4 pages)
+├── predictor.py                # Core prediction logic
+├── t20_data_pipeline.py        # Global T20 player data pipeline
+├── xi_extractor.py             # Playing XI extraction from images (OCR)
+├── video_card.py               # Prediction card image generator
+├── video_card_demo.py          # Demo card (no model needed)
+├── project_paths.py            # Path configuration
+├── requirements.txt            # Dependencies
+├── Datasets/                   # Historical IPL data (CSV)
+│   ├── cricsheet/              # Raw cricsheet YAML files (after --download)
+│   ├── player_stats_enhanced.csv  # Global T20 stats (after pipeline run)
+│   └── player_name_map.csv    # Name normalisation table
+├── Models/                     # Trained model artifacts (PKL)
+└── output/                     # Generated prediction card images
 ```
